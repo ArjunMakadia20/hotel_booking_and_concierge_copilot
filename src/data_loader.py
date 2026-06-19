@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -20,37 +19,27 @@ def get_data_dir(root: Optional[Path] = None) -> Path:
     return root_path / "data"
 
 
-def download_dataset(url: str, target_path: Path, overwrite: bool = False) -> Path:
-    """Download the dataset from a public URL into the raw data directory.
-
-    Args:
-        url: Remote dataset URL.
-        target_path: Local destination path.
-        overwrite: Whether to overwrite an existing file.
-
-    Returns:
-        Path to the downloaded CSV file.
-    """
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    if target_path.exists() and not overwrite:
-        logger.info("Dataset already exists at %s", target_path)
-        return target_path
-
-    logger.info("Downloading dataset from %s", url)
-    urllib.request.urlretrieve(url, target_path)
-    logger.info("Saved dataset to %s", target_path)
-    return target_path
-
-
 def load_hotel_booking_data(csv_path: Path | str) -> pd.DataFrame:
     """Load hotel booking data from a CSV file."""
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found at {path}")
-    df = pd.read_csv(path)
-    return df
+    return pd.read_csv(path)
+
+
+def load_tripadvisor_reviews_data(csv_path: Path | str) -> pd.DataFrame:
+    """Load TripAdvisor hotel reviews data from a CSV file."""
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset not found at {path}")
+    return pd.read_csv(path)
 
 
 def get_default_hotel_booking_path(root: Optional[Path] = None) -> Path:
     """Return the default CSV path for the hotel booking dataset."""
     return get_data_dir(root) / "hotel_bookings.csv"
+
+
+def get_default_tripadvisor_reviews_path(root: Optional[Path] = None) -> Path:
+    """Return the default CSV path for the TripAdvisor reviews dataset."""
+    return get_data_dir(root) / "tripadvisor_hotel_reviews.csv"
