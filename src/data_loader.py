@@ -24,22 +24,10 @@ def load_hotel_booking_data(csv_path: Path | str) -> pd.DataFrame:
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found at {path}")
-    return pd.read_csv(path)
-
-
-def load_tripadvisor_reviews_data(csv_path: Path | str) -> pd.DataFrame:
-    """Load TripAdvisor hotel reviews data from a CSV file."""
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Dataset not found at {path}")
-    return pd.read_csv(path)
+    df = pd.read_csv(path)
+    return df
 
 
 def get_default_hotel_booking_path(root: Optional[Path] = None) -> Path:
     """Return the default CSV path for the hotel booking dataset."""
     return get_data_dir(root) / "hotel_bookings.csv"
-
-
-def get_default_tripadvisor_reviews_path(root: Optional[Path] = None) -> Path:
-    """Return the default CSV path for the TripAdvisor reviews dataset."""
-    return get_data_dir(root) / "tripadvisor_hotel_reviews.csv"
