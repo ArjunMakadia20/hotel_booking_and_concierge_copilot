@@ -3,8 +3,9 @@ numpy
 matplotlib
 seaborn
 scikit-learn
-shap
 xgboost
 joblib
+fastapi
+uvicorn
 jupyterlab
 notebook

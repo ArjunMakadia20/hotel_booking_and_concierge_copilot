@@ -1,9 +1,11 @@
 """
-Reproducible modeling pipeline for Hotel Booking Demand (ADR regression).
+End-to-end pipeline for Hotel Booking **Cancellation** classification.
 
-Wraps the existing src modules into a fast, sampled, end-to-end flow that the
-notebook and the runner script both call. Sampling and dropping high-cardinality
-identifier columns keep training fast and reproducible.
+Runs the whole workflow:
+    load -> EDA -> clean/preprocess -> stratified 80k split -> train 5 models ->
+    evaluate -> save reports/plots -> persist best model + preprocessor.
+
+Call ``run_pipeline()`` (also exposed via the root ``run_pipeline.py`` script).
 """
 
 from __future__ import annotations
@@ -11,108 +13,142 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
+import seaborn as sns
+from sklearn.pipeline import Pipeline
 
 from src.data_loader import get_default_hotel_booking_path, load_hotel_booking_data
 from src.data_processing import (
+    build_preprocessor,
     clean_hotel_booking_data,
-    engineer_features,
-    prepare_features,
+    prepare_xy,
     split_data,
 )
+from src.eda_analysis import iqr_outlier_report, run_eda_analysis
 from src.modeling import (
-    evaluate_regression,
-    train_linear_regression,
-    train_random_forest,
+    comparison_dataframe,
+    save_model,
+    select_best_model,
+    train_and_evaluate,
 )
 
-# High-cardinality identifiers / post-outcome columns that explode one-hot
-# encoding and slow training without helping a "basic above-average" model.
-DROP_COLUMNS = ["country", "agent", "company", "reservation_status"]
+ROOT = Path(__file__).resolve().parent.parent
+REPORTS_DIR = ROOT / "reports"
+MODELS_DIR = ROOT / "models"
 
-try:  # XGBoost preferred; fall back to GradientBoosting if unavailable
-    from src.modeling import train_xgboost
+# Friendly model name -> file slug for per-model report/plot filenames.
+SLUG = {
+    "LogisticRegression": "logistic_regression",
+    "DecisionTree": "decision_tree",
+    "RandomForest": "random_forest",
+    "XGBoost": "xgboost",
+    "MLP": "mlp",
+}
 
-    HAS_XGBOOST = True
-except Exception:  # pragma: no cover - exercised only when xgboost missing
-    HAS_XGBOOST = False
+
+def _save_confusion_matrix(name: str, cm, reports_dir: Path) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False,
+                xticklabels=["Not Cancelled", "Cancelled"],
+                yticklabels=["Not Cancelled", "Cancelled"], ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(f"Confusion Matrix — {name}", fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(reports_dir / f"confusion_matrix_{SLUG[name]}.png", dpi=200, bbox_inches="tight")
+    plt.close()
 
 
-def load_clean_engineer(
+def _save_classification_reports(results: dict[str, dict[str, Any]], reports_dir: Path) -> None:
+    """Write a single consolidated markdown report of every model."""
+    lines = ["# Classification Reports — Cancellation Models\n"]
+    for name, m in results.items():
+        lines.append(f"## {name}\n")
+        lines.append(f"- Accuracy: {m['accuracy']:.4f}")
+        lines.append(f"- Precision: {m['precision']:.4f}")
+        lines.append(f"- Recall: {m['recall']:.4f}")
+        lines.append(f"- F1-score: {m['f1']:.4f}")
+        lines.append(f"- ROC-AUC: {m['roc_auc']:.4f}")
+        lines.append(f"- Train time: {m['train_time_sec']}s\n")
+        lines.append("```")
+        lines.append(m["report"].rstrip())
+        lines.append("```\n")
+    (reports_dir / "classification_reports.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_pipeline(
     csv_path: Path | str | None = None,
-    sample_size: int | None = 25000,
+    train_size: int = 80000,
+    run_eda: bool = True,
     random_state: int = 42,
-) -> pd.DataFrame:
-    """Load, clean, feature-engineer and (optionally) sample the dataset."""
+) -> dict[str, Any]:
+    """Execute the full cancellation-classification workflow."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --- Load & clean -----------------------------------------------------
     path = Path(csv_path) if csv_path else get_default_hotel_booking_path()
-    df = load_hotel_booking_data(path)
-    df = clean_hotel_booking_data(df)
-    df = engineer_features(df)
-    df = df.drop(columns=[c for c in DROP_COLUMNS if c in df.columns])
-    if sample_size and len(df) > sample_size:
-        df = df.sample(n=sample_size, random_state=random_state).reset_index(drop=True)
-    return df
+    df_raw = load_hotel_booking_data(path)
+    df = clean_hotel_booking_data(df_raw)
+    print(f"Loaded {len(df_raw):,} rows -> cleaned {df.shape}")
 
+    # --- EDA --------------------------------------------------------------
+    if run_eda:
+        run_eda_analysis(df, REPORTS_DIR)
+        outliers = iqr_outlier_report(df)
+        outliers.to_csv(REPORTS_DIR / "outlier_report.csv", index=False)
+        print("Outlier report (IQR):")
+        print(outliers.to_string(index=False))
 
-def build_splits(
-    df: pd.DataFrame,
-    target: str = "adr",
-    test_size: float = 0.2,
-    random_state: int = 42,
-):
-    """Encode features and split into train/test."""
-    X, y = prepare_features(df, target_column=target)
-    return split_data(X, y, test_size=test_size, random_state=random_state)
+    # --- Features / split -------------------------------------------------
+    X, y = prepare_xy(df)
+    X_train, X_test, y_train, y_test = split_data(
+        X, y, train_size=train_size, random_state=random_state
+    )
+    print(f"\nSplit: train={len(X_train):,}  test={len(X_test):,}  "
+          f"cancel rate train={y_train.mean():.3f} test={y_test.mean():.3f}")
 
+    # --- Preprocess (fit on train only; NO scaling) -----------------------
+    preprocessor = build_preprocessor(X_train)
+    X_train_enc = preprocessor.fit_transform(X_train)
+    X_test_enc = preprocessor.transform(X_test)
+    print(f"Encoded features: {X_train_enc.shape[1]}")
 
-def train_and_compare(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    random_state: int = 42,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Train the candidate regressors and return (models, metrics_dataframe)."""
-    models: dict[str, Any] = {
-        "LinearRegression": train_linear_regression(X_train, y_train),
-        "RandomForest": train_random_forest(
-            X_train, y_train, n_estimators=100, max_depth=20, random_state=random_state
-        ),
+    # --- Train + evaluate 5 models ---------------------------------------
+    print("\nTraining models:")
+    fitted, results = train_and_evaluate(
+        X_train_enc, y_train, X_test_enc, y_test, random_state=random_state
+    )
+
+    # --- Save comparison + per-model artefacts ---------------------------
+    comp = comparison_dataframe(results)
+    comp.to_csv(REPORTS_DIR / "classification_model_comparison.csv", index=False)
+    print("\n=== Model comparison (sorted by ROC-AUC) ===")
+    print(comp.to_string(index=False))
+
+    _save_classification_reports(results, REPORTS_DIR)
+    for name, m in results.items():
+        _save_confusion_matrix(name, m["confusion_matrix"], REPORTS_DIR)
+
+    # --- Select best, build serveable pipeline, persist -------------------
+    best_name, best_model = select_best_model(results, fitted)
+    print(f"\nBest model (ROC-AUC): {best_name}")
+
+    # Chain the already-fitted preprocessor + model so the API can call
+    # predict/predict_proba on RAW booking input directly.
+    serving = Pipeline(steps=[("preprocessor", preprocessor), ("model", best_model)])
+    save_model(serving, MODELS_DIR / "best_cancellation_model.pkl")
+    save_model(preprocessor, MODELS_DIR / "preprocessor.pkl")
+    print(f"Saved -> models/best_cancellation_model.pkl  (+ preprocessor.pkl)")
+
+    return {
+        "comparison": comp,
+        "results": results,
+        "best_name": best_name,
+        "serving_pipeline": serving,
     }
 
-    if HAS_XGBOOST:
-        models["XGBoost"] = train_xgboost(X_train, y_train, random_state=random_state)
-    else:
-        gb = GradientBoostingRegressor(random_state=random_state)
-        gb.fit(X_train, y_train)
-        models["GradientBoosting"] = gb
 
-    rows = []
-    for name, model in models.items():
-        m = evaluate_regression(model, X_test, y_test)
-        rows.append({"model": name, "R2": m["R2"], "RMSE": m["RMSE"], "MAE": m["MAE"]})
-
-    metrics_df = pd.DataFrame(rows).sort_values("R2", ascending=False).reset_index(drop=True)
-    return models, metrics_df
-
-
-def save_comparison(metrics_df: pd.DataFrame, reports_dir: Path) -> Path:
-    """Persist the model comparison table to reports/model_comparison.csv."""
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    out = reports_dir / "model_comparison.csv"
-    metrics_df.to_csv(out, index=False)
-    return out
-
-
-# Tree-based models eligible for TreeExplainer-based SHAP.
-TREE_MODELS = {"RandomForest", "XGBoost", "GradientBoosting"}
-
-
-def select_best_tree_model(
-    metrics_df: pd.DataFrame, models: dict[str, Any]
-) -> tuple[str, Any]:
-    """Return the best tree-based model (by R2) for SHAP explainability."""
-    tree_rows = metrics_df[metrics_df["model"].isin(TREE_MODELS)]
-    best_name = tree_rows.iloc[0]["model"]
-    return best_name, models[best_name]
+if __name__ == "__main__":
+    run_pipeline()

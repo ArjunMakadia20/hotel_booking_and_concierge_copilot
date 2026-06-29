@@ -1,103 +1,172 @@
-# Hotel Booking and Concierge Copilot
+# Hotel Booking Cancellation Prediction
 
-AI/ML internship project focused on hotel booking analytics and concierge copilot
-development. The current milestone is an **end-to-end, explainable regression
-pipeline that predicts a booking's Average Daily Rate (ADR)**.
+Predict whether a hotel booking will be **cancelled**, and return the **probability**
+of cancellation, so hotels can act on at-risk reservations (overbooking, deposits,
+follow-ups).
 
-## Project Overview
+```json
+{ "prediction": 1, "label": "Cancelled", "cancellation_probability": 0.87 }
+```
 
-Hotels need to understand and forecast room pricing for revenue management. This
-project treats **ADR** (a booking's average daily rate) as a regression target,
-compares several models, selects the best, and explains *which booking attributes
-drive price* using SHAP.
+> **Project pivot:** this repo previously predicted **ADR (Average Daily Rate)** as a
+> regression target. The goal changed completely, so all ADR-regression code, plots,
+> reports and the SHAP-for-ADR module were **removed** (not archived). `adr` is now
+> just one input *feature*, no longer the target.
 
-Workflow: load → clean → feature-engineer → EDA → train/compare models → evaluate →
-explain (SHAP) → conclude. It is reproducible (`random_state=42`) and fast — it uses
-row sampling so the whole project runs in a couple of minutes.
+## Problem statement
+Binary **classification**: each booking is either cancelled (`is_canceled = 1`) or not
+(`is_canceled = 0`). We want both the predicted class **and** a calibrated probability,
+so the output is actionable and threshold-tunable.
 
-## Datasets
+## Dataset
+- **`data/hotel_bookings.csv`** — 119,390 bookings × 32 columns. The modeling dataset.
+- `data/tripadvisor_hotel_reviews.csv` — reserved for future concierge/recommendation
+  work; not used for cancellation modeling.
 
-1. **Hotel Booking Demand Dataset** — `data/hotel_bookings.csv` (~119k bookings, 32
-   columns, ~16 MB). **Target: `adr` (Average Daily Rate).** This is the dataset used
-   for modeling.
-2. TripAdvisor Hotel Reviews Dataset — `data/tripadvisor_hotel_reviews.csv` (reserved
-   for future concierge/recommendation work).
+**Target:** `is_canceled` (0 = Not Cancelled, 1 = Cancelled).
 
-> If `data/hotel_bookings.csv` is missing, the pipeline raises a clear
-> `FileNotFoundError`. Place the CSV at that path to run the project.
+## Why this is classification
+The target is a discrete yes/no outcome and we need a **probability of cancellation**,
+which is exactly what a probabilistic classifier (`predict_proba`) provides — not a
+continuous value (that was the old ADR regression task).
 
-## Steps Completed
+## Data understanding & EDA
+Full write-up in [`reports/eda_summary.md`](reports/eda_summary.md); plots in `reports/`.
 
-1. Data loading (`src/data_loader.py`)
-2. Cleaning — dedupe, impute sparse fields, fix invalid ADR (`src/data_processing.py`)
-3. Feature engineering — `total_guests`, `total_nights`, `arrival_month_num`,
-   `arrival_quarter`, reservation date parts; high-cardinality identifiers
-   (`country`, `agent`, `company`, `reservation_status`) dropped to keep encoding lean
-4. EDA with 9 saved visualizations in `reports/`
-5. Model training & comparison (`src/pipeline.py`, `src/modeling.py`)
-6. Evaluation metrics saved to `reports/model_comparison.csv`
-7. SHAP explainability for the best tree model (`src/shap_analysis.py`)
-8. Narrative notebook: `notebooks/hotel_booking_and_concierge_copilot_eda.ipynb`
+- **Class balance:** 37.0% of bookings cancel (moderate imbalance) → accuracy alone is
+  misleading; we emphasise recall / F1 / ROC-AUC.
+- **Strongest patterns:** `deposit_type` (Non-Refund cancels **99.4%**), long
+  `lead_time` (monotonic rise), few `total_of_special_requests`, prior
+  `previous_cancellations`, certain `market_segment` / `distribution_channel`,
+  City vs Resort hotel.
+- **Plots generated** (in `reports/`): `cancellation_class_distribution.png`,
+  `cancellation_rate_by_*` (hotel, lead_time, lead_time_group, arrival_month,
+  market_segment, distribution_channel, deposit_type, customer_type,
+  reserved/assigned_room_type, special_requests, previous_cancellations,
+  parking_spaces), `missing_values.png`, `correlation_heatmap.png`,
+  `outlier_boxplots.png`.
 
-## Models Trained
+### Outlier analysis
+Checked 13 key numeric fields with the **IQR rule** (`reports/outlier_report.csv`,
+`outlier_boxplots.png`). Flagged values are mostly **legitimate rare cases** (large
+parties, many booking changes, one extreme `adr`), so they are **reported, not
+removed** — tree models are robust to them and the tails carry real signal. Only
+impossible values were fixed (negative `adr` → 0).
 
-| Model | Notes |
-|-------|-------|
-| Linear Regression | Baseline |
-| Random Forest | Non-linear ensemble (100 trees) |
-| XGBoost | Gradient-boosted trees (falls back to `GradientBoostingRegressor` if XGBoost is unavailable) |
+## Preprocessing
+- **Missing values:** `children`→0, `country`→`"UNKNOWN"`, `agent`/`company`→0 (ID
+  codes kept numeric; `company` is 94% empty so it acts as a presence flag).
+- **Leakage removed:** `reservation_status`, `reservation_status_date` (they reveal the
+  final outcome and aren't available at prediction time).
+- **Encoding:** one-hot for categoricals (`OneHotEncoder`, rare categories bucketed via
+  `min_frequency`, unseen categories ignored at serving time).
+- **No normalization** (supervisor rule). Numerics pass through unchanged. **Exception:**
+  a `StandardScaler` is applied **only inside the MLP's own pipeline**, because neural
+  nets are scale-sensitive — no other model or the saved data is scaled.
+- **Split:** stratified, **~80,000 training records** (rest → test, ~39,390).
 
-## Evaluation Results
+## Models trained
+| Model | Type | Bias/Variance note |
+|-------|------|--------------------|
+| Logistic Regression | Linear (baseline) | High bias, low variance |
+| Decision Tree | Non-linear | Low bias, high variance if unpruned |
+| Random Forest | Non-linear ensemble (bagging) | Reduces variance |
+| XGBoost | Non-linear ensemble (boosting) | Reduces bias, controls variance |
+| MLP Classifier | Deep learning (non-linear) | Flexible, can overfit; scaled inputs |
 
-Test set (5,000 bookings held out from a 25,000-row reproducible sample):
+## Evaluation metrics
+Accuracy, Precision, Recall, F1, **ROC-AUC** (primary), Confusion Matrix, and full
+Classification Report — saved to `reports/classification_model_comparison.csv`,
+`reports/classification_reports.md`, and `reports/confusion_matrix_*.png`.
+Why not accuracy alone? With 37% cancellations, a "never cancels" model scores ~63%
+while being useless — see [`reports/modeling_concepts.md`](reports/modeling_concepts.md).
 
-| Model | R² | RMSE | MAE |
-|-------|-----|------|-----|
-| **RandomForest** | **0.798** | **23.28** | **15.68** |
-| XGBoost | 0.790 | 23.74 | 16.94 |
-| LinearRegression | 0.486 | 37.18 | 27.49 |
+## Model comparison (test set, 39,390 bookings)
+| Model | Accuracy | Precision | Recall | F1 | ROC-AUC | Train time |
+|-------|----------|-----------|--------|-----|---------|-----------|
+| **XGBoost** | **0.882** | 0.861 | **0.813** | **0.836** | **0.954** | 1.2s |
+| Random Forest | 0.879 | 0.891 | 0.767 | 0.825 | 0.953 | 2.0s |
+| MLP | 0.863 | 0.839 | 0.781 | 0.809 | 0.939 | 18.7s |
+| Decision Tree | 0.848 | 0.838 | 0.732 | 0.782 | 0.927 | 0.9s |
+| Logistic Regression | 0.806 | 0.798 | 0.638 | 0.709 | 0.874 | 14.3s |
 
-**Best model: Random Forest** — explains ~80% of ADR variance, far ahead of the
-linear baseline, confirming ADR is driven by non-linear feature interactions.
-Full numbers: `reports/model_comparison.csv`.
+**Best model: XGBoost** — best ROC-AUC & F1, best probability ranking, and one of the
+fastest. Random Forest is a close second; Logistic Regression generalizes worst.
 
-## SHAP Explanation
+## Linear vs non-linear conclusion
+**Non-linear.** No numeric feature is strongly *linearly* correlated with the target
+(all |corr| < 0.3), the dominant driver is categorical with threshold behaviour, and
+every non-linear model beats the linear Logistic Regression baseline by a wide margin
+(ROC-AUC 0.93–0.95 vs 0.87). Cancellation is driven by **interactions and thresholds**.
 
-SHAP (TreeExplainer) was run on the best tree model over a sampled subset of the
-test set. Artifacts:
+## Bias & variance (summary)
+Logistic Regression **underfits** (high bias). A single Decision Tree **overfits** (high
+variance). Random Forest **averages** many trees to cut variance; XGBoost **boosts** to
+cut bias while regularizing variance — and **generalizes** best here. The MLP is
+flexible but slower and needs scaled inputs. Full discussion in
+[`reports/modeling_concepts.md`](reports/modeling_concepts.md).
 
-- `reports/shap_feature_importance.png` — global importance (mean |SHAP|)
-- `reports/shap_summary.png` — beeswarm (impact + direction per feature)
+## Probability prediction
+The classifier's `predict_proba` gives P(cancel). We report the class (threshold 0.5)
+**and** the probability, so downstream systems can choose their own cut-off (e.g. only
+act when P > 0.7). ROC-AUC was the selection metric precisely because it measures
+probability-ranking quality.
 
-**Top ADR drivers:** `total_guests`, `arrival_month_num` (seasonality),
-`hotel_Resort Hotel`, `arrival_quarter`, `market_segment_Online TA`, `meal_HB`,
-and `lead_time`. These align with real hotel pricing: larger parties, peak-season
-months, resort properties, and the booking channel most influence the nightly rate.
-
-## How to Run
+## How to run
 
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Ensure the dataset is present at data/hotel_bookings.csv
-
-# 3. Run the full pipeline (train, compare, save metrics + SHAP plots)
+# 2. Run EDA + train/compare all 5 models + save best model  (one command)
 python run_pipeline.py
+#   -> reports/  (EDA plots, classification_model_comparison.csv,
+#                 classification_reports.md, confusion_matrix_*.png, outlier_report.csv)
+#   -> models/   (best_cancellation_model.pkl, preprocessor.pkl)
 
-# 4. Or run the narrative notebook end-to-end
+# 3. Explore interactively
 jupyter notebook notebooks/hotel_booking_and_concierge_copilot_eda.ipynb
+
+# 4. Single prediction from Python
+python -m src.predict
+
+# 5. Serve the model with FastAPI
+uvicorn src.api:app --reload
 ```
 
-Outputs land in `reports/` (metrics CSV, SHAP plots, EDA figures).
+### FastAPI usage
+```bash
+# health
+curl http://127.0.0.1:8000/health
+# -> {"status":"ok"}
 
-## Project Structure
+# predict (send only the fields you know; the rest use sensible defaults)
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d '{
+  "hotel": "Resort Hotel", "lead_time": 350, "adults": 2,
+  "deposit_type": "Non Refund", "previous_cancellations": 1,
+  "total_of_special_requests": 0
+}'
+# -> {"prediction":1,"label":"Cancelled","cancellation_probability":...}
+```
+Interactive docs at `http://127.0.0.1:8000/docs`.
 
+## Project structure
 ```text
-data/        hotel_bookings.csv, tripadvisor_hotel_reviews.csv
-src/         data_loader, data_processing, modeling, pipeline, shap_analysis, eda_analysis
-notebooks/   hotel_booking_and_concierge_copilot_eda.ipynb   (full runnable narrative)
-reports/     EDA figures, model_comparison.csv, shap_summary.png, shap_feature_importance.png
+data/        hotel_bookings.csv, tripadvisor_hotel_reviews.csv   (raw — untouched)
+src/         data_loader, data_processing, eda_analysis, modeling, pipeline,
+             predict (inference helper), api (FastAPI)
+notebooks/   hotel_booking_and_concierge_copilot_eda.ipynb
+reports/     EDA plots, classification_model_comparison.csv, classification_reports.md,
+             confusion_matrix_*.png, outlier_report.csv, eda_summary.md, modeling_concepts.md
+models/      best_cancellation_model.pkl, preprocessor.pkl
 run_pipeline.py   end-to-end runner
 requirements.txt
 ```
+
+## Future improvements
+- Probability **calibration** (Platt / isotonic) and threshold tuning to business cost.
+- Hyperparameter search (Optuna) for XGBoost; class-weighting experiments.
+- Richer feature engineering (total nights/guests, ADR-per-person, country grouping).
+- SHAP explainability rebuilt for the **classification** model (the old ADR SHAP was
+  removed). Group rare countries; add monitoring for data drift.
+- Integrate with the concierge dataset for a combined booking-assistant product.
