@@ -12,6 +12,10 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
+# MLflow local tracking store
+mlruns/
+mlflow.db
+
 # VS Code
 .vscode/
 

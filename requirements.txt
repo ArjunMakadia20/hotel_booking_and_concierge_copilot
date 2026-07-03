@@ -7,5 +7,7 @@ xgboost
 joblib
 fastapi
 uvicorn
+mlflow
+httpx
 jupyterlab
 notebook

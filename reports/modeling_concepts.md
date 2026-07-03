@@ -17,6 +17,25 @@ matrices: `confusion_matrix_*.png`. Raw table: `classification_model_comparison.
 fastest to train. Random Forest is essentially tied; XGBoost edges it on recall and
 speed.
 
+## Experiment tracking with MLflow
+
+Beyond the 5-model comparison above, `src/train.py` is the official training entry
+point and uses **MLflow** to formally compare two configurations of the winning
+model (XGBoost), logged under one experiment (`hotel_cancellation_classification`):
+
+| Run | max_depth | Accuracy | Precision | Recall | F1 | ROC-AUC | Train time |
+|-----|-----------|----------|-----------|--------|-----|---------|-----------|
+| baseline | 6 | 0.882 | 0.861 | 0.813 | 0.836 | 0.954 | 1.2s |
+| tuned | 10 | 0.893 | 0.870 | 0.836 | 0.852 | 0.961 | 1.9s |
+
+Only `max_depth` changes between runs — a controlled, one-variable test rather than a
+one-off manual tweak. Each run logs its parameters, all six metrics, a
+confusion-matrix artifact, and the trained model, so the comparison is reproducible
+via `mlflow ui`. The tuned run wins on every metric, showing XGBoost still had
+headroom to model deeper feature interactions; `models/best_cancellation_model.pkl`
+(served by `predict_offline.py` / `api.py`) currently still points at the baseline,
+pending a decision to promote the tuned config to production.
+
 ## Linear vs non-linear data
 
 - **Linear data** means the classes can be separated well by a straight line / flat

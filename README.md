@@ -112,6 +112,23 @@ The classifier's `predict_proba` gives P(cancel). We report the class (threshold
 act when P > 0.7). ROC-AUC was the selection metric precisely because it measures
 probability-ranking quality.
 
+## Experiment tracking (MLflow)
+`src/train.py` is the official training entry point (separate from the exploratory
+`run_pipeline.py`, which compares all 5 models). It logs every run to MLflow under
+experiment `hotel_cancellation_classification`, comparing two XGBoost configs that
+differ by **one hyperparameter**:
+
+| Run | max_depth | Accuracy | Precision | Recall | F1 | ROC-AUC | Train time |
+|-----|-----------|----------|-----------|--------|-----|---------|-----------|
+| baseline | 6 | 0.882 | 0.861 | 0.813 | 0.836 | 0.954 | 1.2s |
+| tuned | 10 | 0.893 | 0.870 | 0.836 | 0.852 | 0.961 | 1.9s |
+
+Each run logs its params, all six metrics, a confusion-matrix artifact, and the model
+itself. The tuned run wins across the board, but `models/best_cancellation_model.pkl`
+(served by `api.py` / `predict_offline.py`) still points at the **baseline** — the
+tuned model is saved separately as `models/xgboost_tuned_max_depth10.pkl` pending a
+decision to promote it. Run `mlflow ui` to compare both visually.
+
 ## How to run
 
 ```bash
@@ -124,14 +141,17 @@ python run_pipeline.py
 #                 classification_reports.md, confusion_matrix_*.png, outlier_report.csv)
 #   -> models/   (best_cancellation_model.pkl, preprocessor.pkl)
 
-# 3. Explore interactively
+# 3. Official training run — retrains XGBoost, logs baseline + tuned experiments to MLflow
+python -m src.train
+mlflow ui   # http://127.0.0.1:5000 — compare the two runs
+
+# 4. Explore interactively
 jupyter notebook notebooks/hotel_booking_and_concierge_copilot_eda.ipynb
 
-# 4. Single prediction from Python
-python -m src.predict
-
-# 5. Serve the model with FastAPI
-uvicorn src.api:app --reload
+# 5. Predict — online (real-time, one booking) or offline (batch CSV)
+python -m src.predict                                                             # single example
+uvicorn src.api:app --reload                                                      # online: FastAPI
+python -m src.predict_offline --input new_bookings.csv --output predictions.csv   # offline: batch CSV
 ```
 
 ### FastAPI usage
@@ -154,12 +174,15 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 ```text
 data/        hotel_bookings.csv, tripadvisor_hotel_reviews.csv   (raw — untouched)
 src/         data_loader, data_processing, eda_analysis, modeling, pipeline,
-             predict (inference helper), api (FastAPI)
+             train (MLflow-tracked training), predict (shared inference helper),
+             predict_offline (batch CLI), api (FastAPI — online)
 notebooks/   hotel_booking_and_concierge_copilot_eda.ipynb
 reports/     EDA plots, classification_model_comparison.csv, classification_reports.md,
              confusion_matrix_*.png, outlier_report.csv, eda_summary.md, modeling_concepts.md
-models/      best_cancellation_model.pkl, preprocessor.pkl
-run_pipeline.py   end-to-end runner
+models/      best_cancellation_model.pkl (baseline), xgboost_tuned_max_depth10.pkl,
+             preprocessor.pkl
+mlruns/, mlflow.db   local MLflow tracking store (gitignored)
+run_pipeline.py   end-to-end EDA + 5-model comparison runner
 requirements.txt
 ```
 

@@ -79,7 +79,7 @@ def _build_row(booking: dict[str, Any]) -> pd.DataFrame:
 
 
 def predict_cancellation(booking: dict[str, Any]) -> dict[str, Any]:
-    """Predict cancellation class + probability for one booking."""
+    """Predict cancellation class + probability for one booking (used by the online API)."""
     model = _get_model()
     X = _build_row(booking)
     proba = float(model.predict_proba(X)[0, 1])
@@ -89,6 +89,32 @@ def predict_cancellation(booking: dict[str, Any]) -> dict[str, Any]:
         "label": "Cancelled" if prediction == 1 else "Not Cancelled",
         "cancellation_probability": round(proba, 4),
     }
+
+
+def predict_batch(df: pd.DataFrame, model_path: Path | None = None) -> pd.DataFrame:
+    """Score many new bookings at once (used by the offline batch script).
+
+    Any ``FEATURE_COLUMNS`` missing from ``df`` are filled from
+    ``FEATURE_DEFAULTS`` so partial exports (e.g. missing ``agent``/``company``)
+    still score correctly. Extra columns in ``df`` are preserved in the output.
+    """
+    model = load_model(model_path) if model_path else _get_model()
+
+    X = df.copy()
+    for col in FEATURE_COLUMNS:
+        if col not in X.columns:
+            X[col] = FEATURE_DEFAULTS[col]
+        else:
+            X[col] = X[col].fillna(FEATURE_DEFAULTS[col])
+
+    proba = model.predict_proba(X[FEATURE_COLUMNS])[:, 1]
+    prediction = (proba >= 0.5).astype(int)
+
+    out = df.copy()
+    out["prediction"] = prediction
+    out["label"] = pd.Series(prediction).map({1: "Cancelled", 0: "Not Cancelled"}).values
+    out["cancellation_probability"] = proba.round(4)
+    return out
 
 
 if __name__ == "__main__":
