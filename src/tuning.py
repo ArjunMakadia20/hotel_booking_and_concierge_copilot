@@ -20,8 +20,11 @@ run under the existing ``hotel_cancellation_classification`` experiment.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Iterable
+
+os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
 import matplotlib.pyplot as plt
 import mlflow
