@@ -20,6 +20,7 @@ Key decisions (per project brief):
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -28,6 +29,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split
 
+logger = logging.getLogger(__name__)
+
 TARGET = "is_canceled"
 
 # Columns that leak the outcome — must never be features.
@@ -35,6 +38,12 @@ LEAKAGE_COLUMNS = ["reservation_status", "reservation_status_date"]
 
 # ID-style numeric codes (filled with 0, kept numeric rather than one-hot).
 ID_NUMERIC_COLUMNS = ["agent", "company"]
+
+# Domain thresholds for targeted removal of impossible rows (see remove_invalid_rows).
+# These are NOT statistical outlier bounds — rare-but-valid extremes are kept.
+MIN_VALID_ADR = 0.0
+MAX_VALID_ADR = 5000.0
+MAX_VALID_ADULTS = 20
 
 # Categorical features encoded via one-hot.
 CATEGORICAL_COLUMNS = [
@@ -131,6 +140,76 @@ def clean_hotel_booking_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop(columns=[c for c in LEAKAGE_COLUMNS if c in df.columns])
 
     return df
+
+
+def _invalid_row_masks(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Return the boolean mask for each domain-invalid-row rule, keyed by rule name.
+
+    Each mask flags rows that cannot represent a real booking. Rules may overlap
+    (a zero-occupancy row can also have non-positive ADR); callers combine them
+    with a logical OR to get the set of rows to drop.
+    """
+    occupancy = (
+        df["adults"].fillna(0) + df["children"].fillna(0) + df["babies"].fillna(0)
+    )
+    return {
+        "adr_non_positive": df["adr"] <= MIN_VALID_ADR,
+        "adr_extreme_high": df["adr"] > MAX_VALID_ADR,
+        "zero_occupancy": occupancy == 0,
+        "implausible_adults": df["adults"] > MAX_VALID_ADULTS,
+    }
+
+
+def invalid_row_report(df: pd.DataFrame) -> pd.DataFrame:
+    """Report how many rows each removal rule matches, plus the unique total.
+
+    Purely descriptive (nothing is dropped) so the counts can be displayed in the
+    EDA notebook before removal is applied.
+    """
+    masks = _invalid_row_masks(df)
+    union = pd.Series(False, index=df.index)
+    rows = []
+    for name, mask in masks.items():
+        union |= mask
+        rows.append({"rule": name, "rows_matched": int(mask.sum())})
+    rows.append({"rule": "total_unique", "rows_matched": int(union.sum())})
+    return pd.DataFrame(rows)
+
+
+def remove_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop domain-impossible bookings before splitting, keeping valid rare extremes.
+
+    This is targeted, domain-driven cleaning — NOT a blanket IQR trim. Rare-but-valid
+    extremes (long ``lead_time``, high ``previous_cancellations``, many
+    ``booking_changes``, long ``days_in_waiting_list``) are deliberately preserved
+    because they carry genuine cancellation signal. Four rules are applied:
+
+    - ``adr_non_positive``: zero or negative average daily rate (data errors).
+    - ``adr_extreme_high``: a single impossibly high ADR (the ~5,400 record).
+    - ``zero_occupancy``: no adults, children or babies (nonsensical booking).
+    - ``implausible_adults``: dozens of adults on one row (data-entry errors).
+
+    The count removed by each rule and the deduplicated total are logged.
+    """
+    df = df.copy()
+    n_start = len(df)
+
+    masks = _invalid_row_masks(df)
+    union = pd.Series(False, index=df.index)
+    for name, mask in masks.items():
+        union |= mask
+        logger.info("remove_invalid_rows: rule '%s' matched %d rows", name, int(mask.sum()))
+
+    cleaned = df.loc[~union].reset_index(drop=True)
+    n_removed = int(union.sum())
+    logger.info(
+        "remove_invalid_rows: removed %d of %d rows (%.2f%%); %d remain",
+        n_removed,
+        n_start,
+        100.0 * n_removed / max(n_start, 1),
+        len(cleaned),
+    )
+    return cleaned
 
 
 def prepare_xy(df: pd.DataFrame, target: str = TARGET) -> tuple[pd.DataFrame, pd.Series]:

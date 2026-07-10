@@ -37,6 +37,7 @@ from src.data_processing import (
     build_preprocessor,
     clean_hotel_booking_data,
     prepare_xy,
+    remove_invalid_rows,
     split_data,
 )
 from src.modeling import evaluate_classification, save_model
@@ -66,6 +67,7 @@ RUN_CONFIGS: dict[str, dict[str, Any]] = {
 def _load_split(train_size: int = 80000, random_state: int = 42):
     """Load, clean and split the dataset once so both runs train on identical data."""
     df = clean_hotel_booking_data(load_hotel_booking_data(get_default_hotel_booking_path()))
+    df = remove_invalid_rows(df)
     X, y = prepare_xy(df)
     return split_data(X, y, train_size=train_size, random_state=random_state)
 
