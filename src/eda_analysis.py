@@ -16,14 +16,18 @@ A companion ``reports/eda_summary.md`` is written by ``write_eda_summary``.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from sklearn.preprocessing import MinMaxScaler
 
 from src.data_processing import OUTLIER_COLUMNS
+
+logger = logging.getLogger(__name__)
 
 sns.set_style("whitegrid")
 plt.rcParams["figure.figsize"] = (12, 6)
@@ -190,6 +194,63 @@ def plot_outlier_boxplots(df: pd.DataFrame, save_path: Path) -> None:
     plt.savefig(save_path / "outlier_boxplots.png", dpi=200, bbox_inches="tight")
     plt.close()
     print("  saved outlier_boxplots.png")
+
+
+def plot_common_scale_outlier_panel(
+    df: pd.DataFrame,
+    save_path: Path,
+    columns: list[str] | None = None,
+) -> list[Path]:
+    """Boxplot every numeric feature on one shared, rescaled axis for comparison.
+
+    This is a display-only EDA artifact — the rescaling is never fed to the model
+    pipeline (tree models are scale-invariant; the MLP scales inside its own
+    pipeline). Two figures are written and their paths returned:
+
+    - ``outlier_boxplots_common_scale.png``: features ``MinMaxScaler``-mapped to
+      ``[0, 1]`` on a single linear axis, so their spreads are directly comparable.
+    - ``outlier_boxplots_common_scale_log.png``: the same features mapped to
+      ``[1, 10]`` and drawn on a logarithmic axis. Heavily right-skewed count
+      features (``previous_bookings_not_canceled``, ``booking_changes``,
+      ``days_in_waiting_list``) bunch against the floor under plain min-max; the log
+      axis spreads them out so the boxes stay readable.
+
+    ``MinMaxScaler`` is used deliberately (not ``StandardScaler``): it pins every
+    feature to a fixed, bounded range, whereas z-scores are unbounded and would not
+    share a common axis.
+    """
+    cols = [c for c in (columns or OUTLIER_COLUMNS) if c in df.columns]
+    data = df[cols].astype(float)
+
+    linear = MinMaxScaler(feature_range=(0, 1)).fit_transform(data)
+    logscaled = MinMaxScaler(feature_range=(1, 10)).fit_transform(data)
+
+    saved: list[Path] = []
+    panels = [
+        (linear, "linear", "MinMax-scaled value  [0, 1]",
+         "Numeric Features on a Common Scale (MinMax [0, 1]) — display only",
+         "outlier_boxplots_common_scale.png"),
+        (logscaled, "log", "MinMax-scaled value  [1, 10], log axis",
+         "Numeric Features on a Common Scale (MinMax [1, 10], log) — display only",
+         "outlier_boxplots_common_scale_log.png"),
+    ]
+    for values, yscale, ylabel, title, filename in panels:
+        fig, ax = plt.subplots(figsize=(15, 7))
+        ax.boxplot(values, patch_artist=True,
+                   boxprops=dict(facecolor="lightsteelblue"),
+                   flierprops=dict(marker="o", markersize=3, alpha=0.35))
+        ax.set_yscale(yscale)
+        ax.set_xticks(range(1, len(cols) + 1))
+        ax.set_xticklabels(cols, rotation=45, ha="right")
+        ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        path = save_path / filename
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(path)
+        logger.info("saved %s", filename)
+    return saved
 
 
 def iqr_outlier_report(df: pd.DataFrame) -> pd.DataFrame:
