@@ -129,14 +129,19 @@ def run_categorical_refit(
     reports_dir: Path = REPORTS_DIR,
     models_dir: Path = MODELS_DIR,
     run_name: str = "categorical_fix_xgb",
+    model_filename: str = "xgboost_categorical_fix.pkl",
+    cm_filename: str = "confusion_matrix_categorical_fix.png",
+    extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Refit the tuned XGBoost config with native categorical agent/company handling.
 
     ``X_train``/``X_test`` must come from :func:`prepare_xy_native_categorical` (agent
     and company as ``category`` dtype). The model uses the same ``best_params`` as the
-    D4 tuned run, so the only difference from ``optuna_tuned_xgb`` is the ID encoding.
-    Metrics, params and the confusion-matrix figure are logged to MLflow, and the
-    pipeline is saved additively to ``models/xgboost_categorical_fix.pkl``.
+    D4 tuned run, so the only difference from ``optuna_tuned_xgb`` is the ID encoding
+    (and whichever columns the caller has already dropped from ``X``). Metrics, params
+    and the confusion-matrix figure are logged to MLflow, and the pipeline is saved
+    additively under ``model_filename``; ``extra_params`` are logged verbatim so a run
+    can record, e.g., which leakage columns were removed.
     """
     pipeline = build_xgb_pipeline(
         X_train, random_state=random_state, n_jobs=-1, native_categorical=True, **best_params
@@ -147,9 +152,9 @@ def run_categorical_refit(
     reports_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     cm_fig = _confusion_matrix_figure(metrics["confusion_matrix"], run_name)
-    cm_path = reports_dir / "confusion_matrix_categorical_fix.png"
+    cm_path = reports_dir / cm_filename
     cm_fig.savefig(cm_path, dpi=200, bbox_inches="tight")
-    model_path = models_dir / "xgboost_categorical_fix.pkl"
+    model_path = models_dir / model_filename
     save_model(pipeline, model_path)
 
     mlflow.set_experiment(experiment_name)
@@ -165,6 +170,8 @@ def run_categorical_refit(
             }
         )
         mlflow.log_params({f"best_{k}": v for k, v in best_params.items()})
+        if extra_params:
+            mlflow.log_params(extra_params)
         mlflow.log_metrics(
             {
                 "test_accuracy": metrics["accuracy"],

@@ -46,6 +46,12 @@ ID_NUMERIC_COLUMNS = ["agent", "company"]
 # High-cardinality ID columns handled as native XGBoost categoricals (never numeric).
 NATIVE_CATEGORICAL_COLUMNS = ["agent", "company"]
 
+# Post-booking-time fields — only known after a booking exists, so they leak the
+# outcome for an at-booking-time model. Not auto-dropped in cleaning (the legacy feature
+# set and EDA are left intact); excluded from the model via the drop_columns argument of
+# prepare_xy_native_categorical.
+POST_BOOKING_LEAKAGE_COLUMNS = ["assigned_room_type", "booking_changes"]
+
 # Domain thresholds for targeted removal of impossible rows (see remove_invalid_rows).
 # These are NOT statistical outlier bounds — rare-but-valid extremes are kept.
 MIN_VALID_ADR = 0.0
@@ -272,23 +278,30 @@ def _to_native_categoricals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_xy_native_categorical(
-    df: pd.DataFrame, target: str = TARGET
+    df: pd.DataFrame,
+    target: str = TARGET,
+    drop_columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Feature/target split with agent/company typed as native categoricals.
 
     Identical feature set to :func:`prepare_xy`, except the ID columns are excluded
     from the numeric block and returned as ``category`` dtype so XGBoost's
     ``enable_categorical`` handles them without treating IDs as ordered magnitudes.
+
+    ``drop_columns`` removes named fields from the feature matrix before typing — used
+    to exclude :data:`POST_BOOKING_LEAKAGE_COLUMNS` from the at-booking-time model. It
+    defaults to ``None`` so the full-feature D5 behaviour is unchanged.
     """
     if target not in df.columns:
         raise ValueError(f"Target column '{target}' not found in data")
 
+    excluded = set(drop_columns or [])
     y = df[target].astype(int)
     numeric = [c for c in NUMERIC_COLUMNS if c not in NATIVE_CATEGORICAL_COLUMNS]
     feature_cols = [
         c
         for c in (CATEGORICAL_COLUMNS + numeric + NATIVE_CATEGORICAL_COLUMNS)
-        if c in df.columns
+        if c in df.columns and c not in excluded
     ]
     X = _to_native_categoricals(df[feature_cols].copy())
     return X, y
