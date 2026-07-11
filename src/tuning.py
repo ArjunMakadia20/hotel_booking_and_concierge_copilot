@@ -37,8 +37,8 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score, validation
 from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
 
-from src.data_processing import build_preprocessor
-from src.modeling import evaluate_classification, save_model
+from src.data_processing import build_categorical_preprocessor, build_preprocessor
+from src.modeling import evaluate_classification, load_model, save_model
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ def build_xgb_pipeline(
     X: pd.DataFrame,
     random_state: int = 42,
     n_jobs: int = 1,
+    native_categorical: bool = False,
     **overrides: Any,
 ) -> Pipeline:
     """Return a ``preprocessor + XGBClassifier`` pipeline on raw booking features.
@@ -70,12 +71,128 @@ def build_xgb_pipeline(
     fold. ``overrides`` replace individual XGBoost hyperparameters over
     ``BASE_XGB_PARAMS``; ``n_jobs`` defaults to 1 so an outer parallel CV loop does
     not oversubscribe the cores.
+
+    When ``native_categorical`` is True the agent/company ID columns are passed to
+    XGBoost as native categoricals (``enable_categorical=True``, ``tree_method='hist'``)
+    via :func:`build_categorical_preprocessor`, instead of the numeric passthrough
+    used by the default one-hot preprocessor.
     """
     params = {**BASE_XGB_PARAMS, **overrides}
+    if native_categorical:
+        preprocessor = build_categorical_preprocessor(X)
+        params = {**params, "enable_categorical": True, "tree_method": "hist"}
+    else:
+        preprocessor = build_preprocessor(X)
     model = XGBClassifier(random_state=random_state, n_jobs=n_jobs, **params)
-    return Pipeline(
-        steps=[("preprocessor", build_preprocessor(X)), ("model", model)]
+    return Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
+
+
+TUNED_PARAM_KEYS = [
+    "max_depth",
+    "min_child_weight",
+    "gamma",
+    "reg_lambda",
+    "reg_alpha",
+    "learning_rate",
+    "n_estimators",
+    "subsample",
+    "colsample_bytree",
+]
+
+
+def metrics_comparison_table(metrics_by_name: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """Tidy accuracy/precision/recall/F1/ROC-AUC/PR-AUC table across named runs."""
+    keys = ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
+    rows = [{"model": name, **{k: m[k] for k in keys}} for name, m in metrics_by_name.items()]
+    return pd.DataFrame(rows)
+
+
+def extract_best_params(model_path: Path) -> dict[str, Any]:
+    """Read the tuned XGBoost hyperparameters back out of a saved serving pipeline.
+
+    Used so the categorical refit reuses the *exact* D4 Optuna configuration rather
+    than a re-typed copy, isolating the encoding change in the comparison.
+    """
+    pipeline = load_model(model_path)
+    xgb_params = pipeline.named_steps["model"].get_params()
+    return {k: xgb_params[k] for k in TUNED_PARAM_KEYS}
+
+
+def run_categorical_refit(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    best_params: dict[str, Any],
+    random_state: int = 42,
+    experiment_name: str = EXPERIMENT_NAME,
+    reports_dir: Path = REPORTS_DIR,
+    models_dir: Path = MODELS_DIR,
+    run_name: str = "categorical_fix_xgb",
+) -> dict[str, Any]:
+    """Refit the tuned XGBoost config with native categorical agent/company handling.
+
+    ``X_train``/``X_test`` must come from :func:`prepare_xy_native_categorical` (agent
+    and company as ``category`` dtype). The model uses the same ``best_params`` as the
+    D4 tuned run, so the only difference from ``optuna_tuned_xgb`` is the ID encoding.
+    Metrics, params and the confusion-matrix figure are logged to MLflow, and the
+    pipeline is saved additively to ``models/xgboost_categorical_fix.pkl``.
+    """
+    pipeline = build_xgb_pipeline(
+        X_train, random_state=random_state, n_jobs=-1, native_categorical=True, **best_params
     )
+    pipeline.fit(X_train, y_train)
+    metrics = evaluate_classification(pipeline, X_test, y_test)
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    cm_fig = _confusion_matrix_figure(metrics["confusion_matrix"], run_name)
+    cm_path = reports_dir / "confusion_matrix_categorical_fix.png"
+    cm_fig.savefig(cm_path, dpi=200, bbox_inches="tight")
+    model_path = models_dir / "xgboost_categorical_fix.pkl"
+    save_model(pipeline, model_path)
+
+    mlflow.set_experiment(experiment_name)
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params(
+            {
+                "model_type": "XGBClassifier",
+                "encoding": "native_categorical_agent_company",
+                "enable_categorical": True,
+                "tree_method": "hist",
+                "train_size": len(X_train),
+                "test_size": len(X_test),
+            }
+        )
+        mlflow.log_params({f"best_{k}": v for k, v in best_params.items()})
+        mlflow.log_metrics(
+            {
+                "test_accuracy": metrics["accuracy"],
+                "test_precision": metrics["precision"],
+                "test_recall": metrics["recall"],
+                "test_f1": metrics["f1"],
+                "test_roc_auc": metrics["roc_auc"],
+                "test_pr_auc": metrics["pr_auc"],
+            }
+        )
+        mlflow.log_text(metrics["report"], "classification_report.txt")
+        mlflow.log_figure(cm_fig, "confusion_matrix.png")
+        mlflow.sklearn.log_model(pipeline, name="model", serialization_format="pickle")
+    plt.close(cm_fig)
+
+    logger.info(
+        "categorical_fix test: acc=%.4f f1=%.4f roc_auc=%.4f pr_auc=%.4f -> %s",
+        metrics["accuracy"], metrics["f1"], metrics["roc_auc"], metrics["pr_auc"],
+        model_path.name,
+    )
+
+    return {
+        "pipeline": pipeline,
+        "test_metrics": metrics,
+        "model_path": model_path,
+        "confusion_matrix_path": cm_path,
+        "best_params": best_params,
+    }
 
 
 def run_max_depth_validation_curve(

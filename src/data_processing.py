@@ -14,8 +14,12 @@ Key decisions (per project brief):
 - **No global normalization** (supervisor requirement). Numeric features are
   passed through unchanged. Scaling is applied *only* inside the MLP model's own
   pipeline (see ``modeling.py``), never here.
-- ``agent``/``company`` are ID codes -> filled with 0 and treated as numeric so
-  they do not blow up one-hot encoding.
+- ``agent``/``company`` are high-cardinality ID codes. For the legacy five-model
+  comparison they are filled with 0 and passed through numerically. For the tuned
+  XGBoost path they are recast as ``category`` dtype (``NONE`` for missing) and fed
+  to XGBoost's native categorical support, so their integer IDs are never read as
+  ordered magnitudes. See ``prepare_xy_native_categorical`` /
+  ``build_categorical_preprocessor``.
 """
 
 from __future__ import annotations
@@ -38,6 +42,9 @@ LEAKAGE_COLUMNS = ["reservation_status", "reservation_status_date"]
 
 # ID-style numeric codes (filled with 0, kept numeric rather than one-hot).
 ID_NUMERIC_COLUMNS = ["agent", "company"]
+
+# High-cardinality ID columns handled as native XGBoost categoricals (never numeric).
+NATIVE_CATEGORICAL_COLUMNS = ["agent", "company"]
 
 # Domain thresholds for targeted removal of impossible rows (see remove_invalid_rows).
 # These are NOT statistical outlier bounds — rare-but-valid extremes are kept.
@@ -246,6 +253,78 @@ def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
         ],
         remainder="drop",
     )
+
+
+def _to_native_categoricals(df: pd.DataFrame) -> pd.DataFrame:
+    """Recast the ID columns to ``category`` dtype with an explicit ``NONE`` label.
+
+    ``clean_hotel_booking_data`` fills missing agent/company with 0; here 0 becomes
+    the ``NONE`` category (no agent / not a company booking) and every other ID
+    becomes its own string category. Returns a copy; other columns are untouched.
+    """
+    df = df.copy()
+    for col in NATIVE_CATEGORICAL_COLUMNS:
+        if col in df.columns:
+            codes = df[col].astype(int)
+            labels = codes.astype(str).where(codes != 0, "NONE")
+            df[col] = labels.astype("category")
+    return df
+
+
+def prepare_xy_native_categorical(
+    df: pd.DataFrame, target: str = TARGET
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Feature/target split with agent/company typed as native categoricals.
+
+    Identical feature set to :func:`prepare_xy`, except the ID columns are excluded
+    from the numeric block and returned as ``category`` dtype so XGBoost's
+    ``enable_categorical`` handles them without treating IDs as ordered magnitudes.
+    """
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found in data")
+
+    y = df[target].astype(int)
+    numeric = [c for c in NUMERIC_COLUMNS if c not in NATIVE_CATEGORICAL_COLUMNS]
+    feature_cols = [
+        c
+        for c in (CATEGORICAL_COLUMNS + numeric + NATIVE_CATEGORICAL_COLUMNS)
+        if c in df.columns
+    ]
+    X = _to_native_categoricals(df[feature_cols].copy())
+    return X, y
+
+
+def build_categorical_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
+    """Preprocessor for the native-categorical XGBoost path.
+
+    Mirrors :func:`build_preprocessor` exactly for the low-cardinality categoricals
+    (one-hot, rare-bucketed) and the true numerics (passthrough); the only difference
+    is that agent/company pass through as their ``category`` dtype rather than as
+    numeric columns. ``set_output('pandas')`` keeps the category dtype intact through
+    the transformer so ``XGBClassifier(enable_categorical=True)`` can consume it.
+    """
+    categorical = [c for c in CATEGORICAL_COLUMNS if c in X.columns]
+    numeric = [
+        c
+        for c in NUMERIC_COLUMNS
+        if c in X.columns and c not in NATIVE_CATEGORICAL_COLUMNS
+    ]
+    native = [c for c in NATIVE_CATEGORICAL_COLUMNS if c in X.columns]
+
+    one_hot = OneHotEncoder(
+        handle_unknown="ignore",
+        min_frequency=0.01,
+        sparse_output=False,
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            ("cat", one_hot, categorical),
+            ("num", "passthrough", numeric),
+            ("native", "passthrough", native),
+        ],
+        remainder="drop",
+    ).set_output(transform="pandas")
 
 
 def split_data(
