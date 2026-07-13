@@ -14,12 +14,17 @@ Key decisions (per project brief):
 - **No global normalization** (supervisor requirement). Numeric features are
   passed through unchanged. Scaling is applied *only* inside the MLP model's own
   pipeline (see ``modeling.py``), never here.
-- ``agent``/``company`` are ID codes -> filled with 0 and treated as numeric so
-  they do not blow up one-hot encoding.
+- ``agent``/``company`` are high-cardinality ID codes. For the legacy five-model
+  comparison they are filled with 0 and passed through numerically. For the tuned
+  XGBoost path they are recast as ``category`` dtype (``NONE`` for missing) and fed
+  to XGBoost's native categorical support, so their integer IDs are never read as
+  ordered magnitudes. See ``prepare_xy_native_categorical`` /
+  ``build_categorical_preprocessor``.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -28,6 +33,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split
 
+logger = logging.getLogger(__name__)
+
 TARGET = "is_canceled"
 
 # Columns that leak the outcome — must never be features.
@@ -35,6 +42,21 @@ LEAKAGE_COLUMNS = ["reservation_status", "reservation_status_date"]
 
 # ID-style numeric codes (filled with 0, kept numeric rather than one-hot).
 ID_NUMERIC_COLUMNS = ["agent", "company"]
+
+# High-cardinality ID columns handled as native XGBoost categoricals (never numeric).
+NATIVE_CATEGORICAL_COLUMNS = ["agent", "company"]
+
+# Post-booking-time fields — only known after a booking exists, so they leak the
+# outcome for an at-booking-time model. Not auto-dropped in cleaning (the legacy feature
+# set and EDA are left intact); excluded from the model via the drop_columns argument of
+# prepare_xy_native_categorical.
+POST_BOOKING_LEAKAGE_COLUMNS = ["assigned_room_type", "booking_changes"]
+
+# Domain thresholds for targeted removal of impossible rows (see remove_invalid_rows).
+# These are NOT statistical outlier bounds — rare-but-valid extremes are kept.
+MIN_VALID_ADR = 0.0
+MAX_VALID_ADR = 5000.0
+MAX_VALID_ADULTS = 20
 
 # Categorical features encoded via one-hot.
 CATEGORICAL_COLUMNS = [
@@ -133,6 +155,76 @@ def clean_hotel_booking_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _invalid_row_masks(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """Return the boolean mask for each domain-invalid-row rule, keyed by rule name.
+
+    Each mask flags rows that cannot represent a real booking. Rules may overlap
+    (a zero-occupancy row can also have non-positive ADR); callers combine them
+    with a logical OR to get the set of rows to drop.
+    """
+    occupancy = (
+        df["adults"].fillna(0) + df["children"].fillna(0) + df["babies"].fillna(0)
+    )
+    return {
+        "adr_non_positive": df["adr"] <= MIN_VALID_ADR,
+        "adr_extreme_high": df["adr"] > MAX_VALID_ADR,
+        "zero_occupancy": occupancy == 0,
+        "implausible_adults": df["adults"] > MAX_VALID_ADULTS,
+    }
+
+
+def invalid_row_report(df: pd.DataFrame) -> pd.DataFrame:
+    """Report how many rows each removal rule matches, plus the unique total.
+
+    Purely descriptive (nothing is dropped) so the counts can be displayed in the
+    EDA notebook before removal is applied.
+    """
+    masks = _invalid_row_masks(df)
+    union = pd.Series(False, index=df.index)
+    rows = []
+    for name, mask in masks.items():
+        union |= mask
+        rows.append({"rule": name, "rows_matched": int(mask.sum())})
+    rows.append({"rule": "total_unique", "rows_matched": int(union.sum())})
+    return pd.DataFrame(rows)
+
+
+def remove_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop domain-impossible bookings before splitting, keeping valid rare extremes.
+
+    This is targeted, domain-driven cleaning — NOT a blanket IQR trim. Rare-but-valid
+    extremes (long ``lead_time``, high ``previous_cancellations``, many
+    ``booking_changes``, long ``days_in_waiting_list``) are deliberately preserved
+    because they carry genuine cancellation signal. Four rules are applied:
+
+    - ``adr_non_positive``: zero or negative average daily rate (data errors).
+    - ``adr_extreme_high``: a single impossibly high ADR (the ~5,400 record).
+    - ``zero_occupancy``: no adults, children or babies (nonsensical booking).
+    - ``implausible_adults``: dozens of adults on one row (data-entry errors).
+
+    The count removed by each rule and the deduplicated total are logged.
+    """
+    df = df.copy()
+    n_start = len(df)
+
+    masks = _invalid_row_masks(df)
+    union = pd.Series(False, index=df.index)
+    for name, mask in masks.items():
+        union |= mask
+        logger.info("remove_invalid_rows: rule '%s' matched %d rows", name, int(mask.sum()))
+
+    cleaned = df.loc[~union].reset_index(drop=True)
+    n_removed = int(union.sum())
+    logger.info(
+        "remove_invalid_rows: removed %d of %d rows (%.2f%%); %d remain",
+        n_removed,
+        n_start,
+        100.0 * n_removed / max(n_start, 1),
+        len(cleaned),
+    )
+    return cleaned
+
+
 def prepare_xy(df: pd.DataFrame, target: str = TARGET) -> tuple[pd.DataFrame, pd.Series]:
     """Split a cleaned frame into feature matrix X and target vector y."""
     if target not in df.columns:
@@ -167,6 +259,85 @@ def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
         ],
         remainder="drop",
     )
+
+
+def _to_native_categoricals(df: pd.DataFrame) -> pd.DataFrame:
+    """Recast the ID columns to ``category`` dtype with an explicit ``NONE`` label.
+
+    ``clean_hotel_booking_data`` fills missing agent/company with 0; here 0 becomes
+    the ``NONE`` category (no agent / not a company booking) and every other ID
+    becomes its own string category. Returns a copy; other columns are untouched.
+    """
+    df = df.copy()
+    for col in NATIVE_CATEGORICAL_COLUMNS:
+        if col in df.columns:
+            codes = df[col].astype(int)
+            labels = codes.astype(str).where(codes != 0, "NONE")
+            df[col] = labels.astype("category")
+    return df
+
+
+def prepare_xy_native_categorical(
+    df: pd.DataFrame,
+    target: str = TARGET,
+    drop_columns: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Feature/target split with agent/company typed as native categoricals.
+
+    Identical feature set to :func:`prepare_xy`, except the ID columns are excluded
+    from the numeric block and returned as ``category`` dtype so XGBoost's
+    ``enable_categorical`` handles them without treating IDs as ordered magnitudes.
+
+    ``drop_columns`` removes named fields from the feature matrix before typing — used
+    to exclude :data:`POST_BOOKING_LEAKAGE_COLUMNS` from the at-booking-time model. It
+    defaults to ``None`` so the full-feature D5 behaviour is unchanged.
+    """
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found in data")
+
+    excluded = set(drop_columns or [])
+    y = df[target].astype(int)
+    numeric = [c for c in NUMERIC_COLUMNS if c not in NATIVE_CATEGORICAL_COLUMNS]
+    feature_cols = [
+        c
+        for c in (CATEGORICAL_COLUMNS + numeric + NATIVE_CATEGORICAL_COLUMNS)
+        if c in df.columns and c not in excluded
+    ]
+    X = _to_native_categoricals(df[feature_cols].copy())
+    return X, y
+
+
+def build_categorical_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
+    """Preprocessor for the native-categorical XGBoost path.
+
+    Mirrors :func:`build_preprocessor` exactly for the low-cardinality categoricals
+    (one-hot, rare-bucketed) and the true numerics (passthrough); the only difference
+    is that agent/company pass through as their ``category`` dtype rather than as
+    numeric columns. ``set_output('pandas')`` keeps the category dtype intact through
+    the transformer so ``XGBClassifier(enable_categorical=True)`` can consume it.
+    """
+    categorical = [c for c in CATEGORICAL_COLUMNS if c in X.columns]
+    numeric = [
+        c
+        for c in NUMERIC_COLUMNS
+        if c in X.columns and c not in NATIVE_CATEGORICAL_COLUMNS
+    ]
+    native = [c for c in NATIVE_CATEGORICAL_COLUMNS if c in X.columns]
+
+    one_hot = OneHotEncoder(
+        handle_unknown="ignore",
+        min_frequency=0.01,
+        sparse_output=False,
+    )
+
+    return ColumnTransformer(
+        transformers=[
+            ("cat", one_hot, categorical),
+            ("num", "passthrough", numeric),
+            ("native", "passthrough", native),
+        ],
+        remainder="drop",
+    ).set_output(transform="pandas")
 
 
 def split_data(

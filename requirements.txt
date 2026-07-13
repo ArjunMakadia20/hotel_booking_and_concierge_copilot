@@ -99,6 +99,7 @@ opentelemetry-api==1.43.0
 opentelemetry-proto==1.43.0
 opentelemetry-sdk==1.43.0
 opentelemetry-semantic-conventions==0.64b0
+optuna==4.1.0
 packaging==26.2
 pandas==2.3.3
 pandocfilters==1.5.1

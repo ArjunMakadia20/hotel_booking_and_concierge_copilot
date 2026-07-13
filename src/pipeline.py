@@ -23,6 +23,7 @@ from src.data_processing import (
     build_preprocessor,
     clean_hotel_booking_data,
     prepare_xy,
+    remove_invalid_rows,
     split_data,
 )
 from src.eda_analysis import iqr_outlier_report, run_eda_analysis
@@ -100,6 +101,10 @@ def run_pipeline(
         outliers.to_csv(REPORTS_DIR / "outlier_report.csv", index=False)
         print("Outlier report (IQR):")
         print(outliers.to_string(index=False))
+
+    # --- Remove domain-impossible rows (after EDA, before split) ----------
+    df = remove_invalid_rows(df)
+    print(f"After invalid-row removal: {df.shape}")
 
     # --- Features / split -------------------------------------------------
     X, y = prepare_xy(df)

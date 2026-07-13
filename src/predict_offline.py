@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         default=None,
-        help="Optional path to a specific model .pkl (defaults to models/best_cancellation_model.pkl).",
+        help="Optional path to a specific model .pkl (defaults to models/xgboost_leakage_removed.pkl).",
     )
     args = parser.parse_args()
 

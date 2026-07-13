@@ -32,6 +32,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
@@ -105,6 +106,7 @@ def evaluate_classification(
         "recall": recall_score(y, y_pred, zero_division=0),
         "f1": f1_score(y, y_pred, zero_division=0),
         "roc_auc": roc_auc_score(y, y_proba),
+        "pr_auc": average_precision_score(y, y_proba),
         "confusion_matrix": confusion_matrix(y, y_pred),
         "report": classification_report(
             y, y_pred, target_names=["Not Cancelled", "Cancelled"], zero_division=0

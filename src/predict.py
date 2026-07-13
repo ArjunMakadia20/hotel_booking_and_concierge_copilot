@@ -1,28 +1,47 @@
 """
-Inference helper for the cancellation model.
+Inference helper for the canonical cancellation model.
 
-Loads the saved serving pipeline (preprocessor + best model) and turns a partial
-booking dict into a prediction:
+Loads the saved serving pipeline (categorical preprocessor + tuned XGBoost) from
+``models/xgboost_leakage_removed.pkl`` and turns a partial booking dict into a
+prediction:
 
     {"prediction": 1, "label": "Cancelled", "cancellation_probability": 0.87}
 
+The canonical model is the D7 ``leakage_removed_xgb`` pipeline. It differs from the
+legacy one-hot model in two ways that this module honours:
+
+- ``agent``/``company`` are fed as native XGBoost categoricals (``category`` dtype,
+  ``0`` -> ``NONE``), not as numeric IDs. Rows are cast via
+  :func:`src.data_processing._to_native_categoricals` so the preprocessor receives
+  the exact dtypes it was fitted on.
+- The post-booking leakage columns (:data:`POST_BOOKING_LEAKAGE_COLUMNS`) are excluded
+  from the served feature set.
+
 Callers (CLI, FastAPI) only need to pass the fields they know; everything else is
-filled from ``FEATURE_DEFAULTS`` so the one-hot preprocessor always receives the
-full column set it was fitted on.
+filled from ``FEATURE_DEFAULTS`` so the pipeline always receives the full column set
+it was fitted on.
 """
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from src.data_processing import CATEGORICAL_COLUMNS, NUMERIC_COLUMNS
+from src.data_processing import (
+    CATEGORICAL_COLUMNS,
+    NUMERIC_COLUMNS,
+    POST_BOOKING_LEAKAGE_COLUMNS,
+    _to_native_categoricals,
+)
 from src.modeling import load_model
 
-MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "best_cancellation_model.pkl"
+logger = logging.getLogger(__name__)
+
+MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "xgboost_leakage_removed.pkl"
 
 # Sensible neutral defaults for any field the caller omits. Values reflect the
 # most common / lowest-risk booking profile in the dataset.
@@ -35,7 +54,6 @@ FEATURE_DEFAULTS: dict[str, Any] = {
     "market_segment": "Online TA",
     "distribution_channel": "TA/TO",
     "reserved_room_type": "A",
-    "assigned_room_type": "A",
     "deposit_type": "No Deposit",
     "customer_type": "Transient",
     # numeric
@@ -51,7 +69,6 @@ FEATURE_DEFAULTS: dict[str, Any] = {
     "is_repeated_guest": 0,
     "previous_cancellations": 0,
     "previous_bookings_not_canceled": 0,
-    "booking_changes": 0,
     "days_in_waiting_list": 0,
     "adr": 100.0,
     "required_car_parking_spaces": 0,
@@ -60,7 +77,10 @@ FEATURE_DEFAULTS: dict[str, Any] = {
     "company": 0,
 }
 
-FEATURE_COLUMNS = CATEGORICAL_COLUMNS + NUMERIC_COLUMNS
+FEATURE_COLUMNS = [
+    c for c in (CATEGORICAL_COLUMNS + NUMERIC_COLUMNS)
+    if c not in POST_BOOKING_LEAKAGE_COLUMNS
+]
 
 
 @lru_cache(maxsize=1)
@@ -69,13 +89,19 @@ def _get_model():
         raise FileNotFoundError(
             f"Model not found at {MODEL_PATH}. Run `python run_pipeline.py` first."
         )
+    logger.info("loading canonical cancellation model from %s", MODEL_PATH)
     return load_model(MODEL_PATH)
 
 
 def _build_row(booking: dict[str, Any]) -> pd.DataFrame:
-    """Merge user input over defaults into a single-row feature DataFrame."""
+    """Merge user input over defaults into a single-row feature DataFrame.
+
+    ``agent``/``company`` are recast to native ``category`` dtype (``0`` -> ``NONE``)
+    so the DataFrame matches the dtypes the canonical pipeline was fitted on.
+    """
     row = {**FEATURE_DEFAULTS, **{k: v for k, v in booking.items() if v is not None}}
-    return pd.DataFrame([{c: row[c] for c in FEATURE_COLUMNS}])
+    frame = pd.DataFrame([{c: row[c] for c in FEATURE_COLUMNS}])
+    return _to_native_categoricals(frame)
 
 
 def predict_cancellation(booking: dict[str, Any]) -> dict[str, Any]:
@@ -107,7 +133,8 @@ def predict_batch(df: pd.DataFrame, model_path: Path | None = None) -> pd.DataFr
         else:
             X[col] = X[col].fillna(FEATURE_DEFAULTS[col])
 
-    proba = model.predict_proba(X[FEATURE_COLUMNS])[:, 1]
+    X = _to_native_categoricals(X[FEATURE_COLUMNS])
+    proba = model.predict_proba(X)[:, 1]
     prediction = (proba >= 0.5).astype(int)
 
     out = df.copy()
