@@ -1,12 +1,13 @@
 """
-SHAP explainability for the tuned native-categorical XGBoost cancellation model.
+SHAP explainability for the native-categorical XGBoost cancellation model.
 
-The served artefact is a ``preprocessor + XGBClassifier`` pipeline
-(``models/xgboost_categorical_fix.pkl``). SHAP is a model-level explanation, so it
-runs against the inner ``XGBClassifier`` on the *transformed* feature matrix produced
-by the fitted preprocessor; the one-hot columns, numeric passthroughs and the two
-native-categorical ID columns (``agent``/``company``) are all fed to
-``shap.TreeExplainer`` with the same dtypes XGBoost trained on.
+The canonical served artefact is a ``preprocessor + XGBClassifier`` pipeline
+(``models/xgboost_leakage_removed.pkl``); the same functions also explain the earlier
+``models/xgboost_categorical_fix.pkl`` reference model. SHAP is a model-level
+explanation, so it runs against the inner ``XGBClassifier`` on the *transformed*
+feature matrix produced by the fitted preprocessor; the one-hot columns, numeric
+passthroughs and the two native-categorical ID columns (``agent``/``company``) are all
+fed to ``shap.TreeExplainer`` with the same dtypes XGBoost trained on.
 
 All explanations are computed on the held-out TEST split only — SHAP never touches the
 training data and never refits the model. Two importance views are provided: a
@@ -128,14 +129,17 @@ def plot_beeswarm(
     explanation: shap.Explanation,
     save_path: Path,
     max_display: int = 20,
+    title: str = "SHAP summary — categorical_fix_xgb (test split)",
 ) -> Path:
-    """Save the global beeswarm summary plot (top ``max_display`` features)."""
+    """Save the global beeswarm summary plot (top ``max_display`` features).
+
+    ``title`` names the model in the plot heading; pass the canonical model's name
+    when explaining ``xgboost_leakage_removed.pkl`` so the figure is labelled correctly.
+    """
     fig = plt.figure()
     shap.plots.beeswarm(explanation, max_display=max_display, show=False)
     ax = plt.gca()
-    ax.set_title(
-        "SHAP summary — categorical_fix_xgb (test split)", fontweight="bold"
-    )
+    ax.set_title(title, fontweight="bold")
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
