@@ -208,7 +208,7 @@ def plot_common_scale_outlier_panel(
     pipeline). Two figures are written and their paths returned:
 
     - ``outlier_boxplots_common_scale.png``: features ``MinMaxScaler``-mapped to
-      ``[0, 1]`` on a single linear axis, so their spreads are directly comparable.
+      ``[0, 10]`` on a single linear axis, so their spreads are directly comparable.
     - ``outlier_boxplots_common_scale_log.png``: the same features mapped to
       ``[1, 10]`` and drawn on a logarithmic axis. Heavily right-skewed count
       features (``previous_bookings_not_canceled``, ``booking_changes``,
@@ -222,13 +222,13 @@ def plot_common_scale_outlier_panel(
     cols = [c for c in (columns or OUTLIER_COLUMNS) if c in df.columns]
     data = df[cols].astype(float)
 
-    linear = MinMaxScaler(feature_range=(0, 1)).fit_transform(data)
+    linear = MinMaxScaler(feature_range=(0, 10)).fit_transform(data)
     logscaled = MinMaxScaler(feature_range=(1, 10)).fit_transform(data)
 
     saved: list[Path] = []
     panels = [
-        (linear, "linear", "MinMax-scaled value  [0, 1]",
-         "Numeric Features on a Common Scale (MinMax [0, 1]) — display only",
+        (linear, "linear", "MinMax-scaled value  [0, 10]",
+         "Numeric Features on a Common Scale (MinMax [0, 10]) — display only",
          "outlier_boxplots_common_scale.png"),
         (logscaled, "log", "MinMax-scaled value  [1, 10], log axis",
          "Numeric Features on a Common Scale (MinMax [1, 10], log) — display only",
