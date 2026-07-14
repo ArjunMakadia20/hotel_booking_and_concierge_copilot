@@ -201,19 +201,16 @@ def plot_common_scale_outlier_panel(
     save_path: Path,
     columns: list[str] | None = None,
 ) -> list[Path]:
-    """Boxplot every numeric feature on one shared, rescaled axis for comparison.
+    """Boxplot every numeric feature on one shared, rescaled, log-axis panel.
 
     This is a display-only EDA artifact — the rescaling is never fed to the model
     pipeline (tree models are scale-invariant; the MLP scales inside its own
-    pipeline). Two figures are written and their paths returned:
-
-    - ``outlier_boxplots_common_scale.png``: features ``MinMaxScaler``-mapped to
-      ``[0, 10]`` on a single linear axis, so their spreads are directly comparable.
-    - ``outlier_boxplots_common_scale_log.png``: the same features mapped to
-      ``[1, 10]`` and drawn on a logarithmic axis. Heavily right-skewed count
-      features (``previous_bookings_not_canceled``, ``booking_changes``,
-      ``days_in_waiting_list``) bunch against the floor under plain min-max; the log
-      axis spreads them out so the boxes stay readable.
+    pipeline). Features are ``MinMaxScaler``-mapped to ``[1, 10]`` and drawn on a
+    logarithmic axis: heavily right-skewed count features
+    (``previous_bookings_not_canceled``, ``booking_changes``,
+    ``days_in_waiting_list``) bunch against the floor under plain min-max on a
+    linear axis; the log axis spreads them out so outlier structure across all
+    13 features stays visible on one comparable axis.
 
     ``MinMaxScaler`` is used deliberately (not ``StandardScaler``): it pins every
     feature to a fixed, bounded range, whereas z-scores are unbounded and would not
@@ -222,14 +219,10 @@ def plot_common_scale_outlier_panel(
     cols = [c for c in (columns or OUTLIER_COLUMNS) if c in df.columns]
     data = df[cols].astype(float)
 
-    linear = MinMaxScaler(feature_range=(0, 10)).fit_transform(data)
     logscaled = MinMaxScaler(feature_range=(1, 10)).fit_transform(data)
 
     saved: list[Path] = []
     panels = [
-        (linear, "linear", "MinMax-scaled value  [0, 10]",
-         "Numeric Features on a Common Scale (MinMax [0, 10]) — display only",
-         "outlier_boxplots_common_scale.png"),
         (logscaled, "log", "MinMax-scaled value  [1, 10], log axis",
          "Numeric Features on a Common Scale (MinMax [1, 10], log) — display only",
          "outlier_boxplots_common_scale_log.png"),
